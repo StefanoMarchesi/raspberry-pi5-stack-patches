@@ -1,0 +1,24 @@
+From b70049f5ce3e5937f8428f1c677ca4f087616d48 Mon Sep 17 00:00:00 2001
+From: builder <build@local>
+Date: Tue, 7 Jul 2026 15:33:44 +0200
+Subject: [PATCH 3/5] v3d: expose seamless_cube_map cap (enables GL 3.3 core)
+
+---
+ src/gallium/drivers/v3d/v3d_screen.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/gallium/drivers/v3d/v3d_screen.c b/src/gallium/drivers/v3d/v3d_screen.c
+index ac7b2bf7..2505597b 100644
+--- a/src/gallium/drivers/v3d/v3d_screen.c
++++ b/src/gallium/drivers/v3d/v3d_screen.c
+@@ -270,6 +270,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
+         caps->texture_barrier = true;
+         caps->polygon_offset_clamp = true;
+         caps->texture_query_lod = true;
++        caps->seamless_cube_map = true;
+ 
+         caps->query_timestamp =
+         caps->query_time_elapsed = screen->has_cpu_queue && screen->has_multisync;
+-- 
+2.47.3
+

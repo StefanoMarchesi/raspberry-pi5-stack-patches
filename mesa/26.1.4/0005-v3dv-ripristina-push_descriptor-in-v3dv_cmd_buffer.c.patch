@@ -1,0 +1,376 @@
+From faecaa0ae589dad60d84b266f188454b2808d320 Mon Sep 17 00:00:00 2001
+From: Stefano Marchesi <marchesi@studioup.it>
+Date: Tue, 14 Jul 2026 11:55:19 +0200
+Subject: [PATCH 5/5] v3dv: ripristina push_descriptor in v3dv_cmd_buffer.c
+ (309 righe)
+
+Recuperate dalla nostra merge request upstream:
+https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42842
+
+Un git checkout accidentale le aveva cancellate (erano non committate).
+Verificato: il binario ricompilato ha gli stessi 8 simboli push_descriptor del
+binario funzionante, entrambe le estensioni (push_descriptor + ROAA) e il fix
+del flush TMU. God of War II: 29.64 fps, identico al riferimento.
+
+Backup del binario noto-buono: ~/driver-backup/ e /opt/*/lib/*/libvulkan_broadcom.so.GOLD
+---
+ src/broadcom/vulkan/v3dv_cmd_buffer.c | 322 ++++++++++++++++++++++++--
+ 1 file changed, 309 insertions(+), 13 deletions(-)
+
+diff --git a/src/broadcom/vulkan/v3dv_cmd_buffer.c b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+index b47d01c0..4d263c9d 100644
+--- a/src/broadcom/vulkan/v3dv_cmd_buffer.c
++++ b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+@@ -31,6 +31,7 @@
+ #include "util/perf/cpu_trace.h"
+ #include "util/u_pack_color.h"
+ #include "vk_common_entrypoints.h"
++#include "vk_descriptor_update_template.h"
+ #include "vk_util.h"
+ 
+ #define V3D_VERSION 42
+@@ -1372,19 +1373,6 @@ v3dv_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                          const VkRenderPassBeginInfo *pRenderPassBegin,
+                          const VkSubpassBeginInfo *pSubpassBeginInfo)
+ {
+-   if (unlikely(getenv("V3D_RP_STATS"))) {
+-      static unsigned n;
+-      static unsigned last_report;
+-      n++;
+-      const VkRect2D *ra = &pRenderPassBegin->renderArea;
+-      if (n - last_report >= 200) {
+-         last_report = n;
+-         fprintf(stderr, "[v3d-rp] render pass #%u  area=%dx%d offset=%d,%d\n",
+-                 n, ra->extent.width, ra->extent.height,
+-                 ra->offset.x, ra->offset.y);
+-      }
+-   }
+-
+    V3DV_FROM_HANDLE(v3dv_cmd_buffer, cmd_buffer, commandBuffer);
+    V3DV_FROM_HANDLE(v3dv_render_pass, pass, pRenderPassBegin->renderPass);
+    V3DV_FROM_HANDLE(v3dv_framebuffer, framebuffer, pRenderPassBegin->framebuffer);
+@@ -3879,6 +3867,12 @@ v3dv_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
+       V3DV_FROM_HANDLE(v3dv_descriptor_set, set, pDescriptorSets[i]);
+       uint32_t index = firstSet + i;
+ 
++      /* Binding a regular descriptor set to this set number disturbs any
++       * descriptors previously pushed to the same set number, so drop our
++       * accumulation tracking for it (a subsequent push must start fresh).
++       */
++      cmd_buffer->push_descriptor.sets[index] = NULL;
++
+       descriptor_state->valid |= (1u << index);
+       if (descriptor_state->descriptor_sets[index] != set) {
+          descriptor_state->descriptor_sets[index] = set;
+@@ -3917,6 +3911,308 @@ v3dv_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
+    }
+ }
+ 
++/* VK_KHR_push_descriptor:
++ *
++ * We implement push descriptors by allocating an internal descriptor set
++ * with the pushed descriptor set layout from a per-command buffer descriptor
++ * pool that grows on demand, writing the pushed descriptors into it with the
++ * regular descriptor update code, and then binding it to the command buffer
++ * descriptor state exactly like vkCmdBindDescriptorSets would.
++ *
++ * Because a new internal set is allocated on every push, descriptor state
++ * consumed by previously recorded draws/dispatches is never modified, as
++ * required by the spec. The pools backing these sets are registered as
++ * private objects of the command buffer, so they are destroyed when the
++ * command buffer is reset or destroyed, mirroring the lifecycle of the
++ * meta operation descriptor pools (see create_blit_descriptor_pool).
++ */
++static VkResult
++cmd_buffer_create_push_descriptor_pool(struct v3dv_cmd_buffer *cmd_buffer,
++                                       const struct v3dv_descriptor_set_layout *set_layout)
++{
++   struct v3dv_device *device = cmd_buffer->device;
++
++   /* We size the pool BO in units of the largest descriptor size (that of a
++    * combined image sampler) so the pool can accommodate sets with any
++    * combination of descriptor types by requesting that many descriptors of
++    * VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER type.
++    */
++   const uint32_t max_desc_bo_size =
++      v3d_X((&device->devinfo), max_descriptor_bo_size)();
++
++   /* Worst-case descriptor units required by a single set with the layout
++    * being pushed now, considering both its BO footprint (which accounts for
++    * multi-planar formats through the binding plane strides baked in
++    * set_layout->bo_size) and its host descriptor count. This guarantees
++    * that a freshly created pool always fits at least the set that
++    * triggered its creation.
++    */
++   const uint32_t set_units =
++      MAX2(DIV_ROUND_UP(set_layout->bo_size, max_desc_bo_size),
++           MAX2(set_layout->descriptor_count, 1));
++
++   /* If this is not the first pool we create for this command buffer
++    * size it based on the size of the currently exhausted pool.
++    */
++   uint32_t max_sets = 16;
++   if (cmd_buffer->push_descriptor.dspool != VK_NULL_HANDLE) {
++      struct v3dv_descriptor_pool *exhausted_pool =
++         v3dv_descriptor_pool_from_handle(cmd_buffer->push_descriptor.dspool);
++      max_sets = MIN2(exhausted_pool->max_entry_count * 2, 1024);
++   }
++
++   /* Create the descriptor pool */
++   cmd_buffer->push_descriptor.dspool = VK_NULL_HANDLE;
++   VkDescriptorPoolSize pool_size = {
++      .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++      .descriptorCount = max_sets * set_units,
++   };
++   VkDescriptorPoolCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++      .maxSets = max_sets,
++      .poolSizeCount = 1,
++      .pPoolSizes = &pool_size,
++      .flags = 0,
++   };
++   VkResult result =
++      v3dv_CreateDescriptorPool(v3dv_device_to_handle(device),
++                                &info,
++                                &device->vk.alloc,
++                                &cmd_buffer->push_descriptor.dspool);
++
++   if (result == VK_SUCCESS) {
++      assert(cmd_buffer->push_descriptor.dspool != VK_NULL_HANDLE);
++      const VkDescriptorPool _pool = cmd_buffer->push_descriptor.dspool;
++
++      v3dv_cmd_buffer_add_private_obj(
++         cmd_buffer, (uintptr_t) _pool,
++         (v3dv_cmd_buffer_private_obj_destroy_cb)v3dv_DestroyDescriptorPool);
++
++      struct v3dv_descriptor_pool *pool =
++         v3dv_descriptor_pool_from_handle(_pool);
++      pool->is_driver_internal = true;
++   }
++
++   return result;
++}
++
++static struct v3dv_descriptor_set *
++cmd_buffer_allocate_push_descriptor_set(struct v3dv_cmd_buffer *cmd_buffer,
++                                        struct v3dv_descriptor_set_layout *set_layout,
++                                        uint32_t set_index)
++{
++   VkDevice _device = v3dv_device_to_handle(cmd_buffer->device);
++   VkResult result;
++
++   assert(set_index < MAX_SETS);
++
++   /* Make sure we have a descriptor pool */
++   if (cmd_buffer->push_descriptor.dspool == VK_NULL_HANDLE) {
++      result = cmd_buffer_create_push_descriptor_pool(cmd_buffer, set_layout);
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++   assert(cmd_buffer->push_descriptor.dspool != VK_NULL_HANDLE);
++
++   /* Allocate descriptor set */
++   VkDescriptorSetLayout layout_handle =
++      v3dv_descriptor_set_layout_to_handle(set_layout);
++   VkDescriptorSet set_handle = VK_NULL_HANDLE;
++   VkDescriptorSetAllocateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++      .descriptorPool = cmd_buffer->push_descriptor.dspool,
++      .descriptorSetCount = 1,
++      .pSetLayouts = &layout_handle,
++   };
++   result = v3dv_AllocateDescriptorSets(_device, &info, &set_handle);
++
++   /* If we ran out of pool space, grow the pool and try again */
++   if (result == VK_ERROR_OUT_OF_POOL_MEMORY) {
++      result = cmd_buffer_create_push_descriptor_pool(cmd_buffer, set_layout);
++      if (result == VK_SUCCESS) {
++         info.descriptorPool = cmd_buffer->push_descriptor.dspool;
++         result = v3dv_AllocateDescriptorSets(_device, &info, &set_handle);
++      }
++   }
++
++   if (result != VK_SUCCESS)
++      goto fail;
++
++   struct v3dv_descriptor_set *set =
++      v3dv_descriptor_set_from_handle(set_handle);
++
++   /* Accumulate previously pushed descriptors: vkCmdPushDescriptorSet updates
++    * the pushed set and its contents persist across successive pushes to the
++    * same set number until disturbed by binding a regular descriptor set (see
++    * the Vulkan spec, "Push Descriptor Updates" and "Pipeline Layout
++    * Compatibility"). Since we allocate a fresh set (with a fresh region in the
++    * pool BO) for every push so that already-recorded draws keep referencing
++    * stable HW state, we must copy the contents accumulated by the previous
++    * push for this set index into the new set before the caller applies the
++    * new writes on top. We only do this when the previous push used the same
++    * set layout (identical flattened layout, so descriptor indices and BO
++    * offsets match); otherwise the previous contents are disturbed and we
++    * start fresh.
++    */
++   struct v3dv_descriptor_set *prev = cmd_buffer->push_descriptor.sets[set_index];
++   if (prev && prev->layout == set_layout) {
++      memcpy(set->descriptors, prev->descriptors,
++             set_layout->descriptor_count * sizeof(struct v3dv_descriptor));
++
++      if (set_layout->bo_size > 0) {
++         assert(set->pool->bo && set->pool->bo->map);
++         assert(prev->pool->bo && prev->pool->bo->map);
++         memcpy((uint8_t *) set->pool->bo->map + set->base_offset,
++                (uint8_t *) prev->pool->bo->map + prev->base_offset,
++                set_layout->bo_size);
++      }
++   }
++
++   cmd_buffer->push_descriptor.sets[set_index] = set;
++
++   return set;
++
++fail:
++   v3dv_flag_oom(cmd_buffer, NULL);
++   return NULL;
++}
++
++/* Binds a pushed descriptor set to the command buffer state for the given
++ * pipeline bind point, mirroring what v3dv_CmdBindDescriptorSets does for
++ * regular descriptor sets. Note that unlike regular binds, pushed sets are
++ * always freshly allocated, so the descriptor state always changes and we
++ * flag it dirty unconditionally. Push descriptor set layouts can't include
++ * dynamic buffers, so there is no dynamic offset state to update.
++ */
++static void
++cmd_buffer_bind_push_descriptor_set(struct v3dv_cmd_buffer *cmd_buffer,
++                                    VkPipelineBindPoint pipeline_bind_point,
++                                    struct v3dv_descriptor_set *set,
++                                    uint32_t set_index)
++{
++   assert(set_index < MAX_SETS);
++   assert(set->layout->dynamic_offset_count == 0);
++
++   const bool is_compute =
++      pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE;
++
++   struct v3dv_descriptor_state *descriptor_state = is_compute ?
++      &cmd_buffer->state.compute.descriptor_state :
++      &cmd_buffer->state.gfx.descriptor_state;
++
++   descriptor_state->valid |= (1u << set_index);
++   descriptor_state->descriptor_sets[set_index] = set;
++
++   /* Check if we are sampling from a linear 2D image. This is not supported
++    * in hardware, but may be required for some applications so we will
++    * transparently convert to tiled at the expense of performance.
++    */
++   handle_sample_from_linear_image(cmd_buffer, set, is_compute);
++
++   if (!is_compute) {
++      cmd_buffer->state.dirty |= V3DV_CMD_DIRTY_DESCRIPTOR_SETS;
++      cmd_buffer->state.dirty_descriptor_stages |=
++         set->layout->shader_stages & VK_SHADER_STAGE_ALL_GRAPHICS;
++   } else {
++      cmd_buffer->state.dirty |= V3DV_CMD_DIRTY_COMPUTE_DESCRIPTOR_SETS;
++      cmd_buffer->state.dirty_descriptor_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
++   }
++}
++
++VKAPI_ATTR void VKAPI_CALL
++v3dv_CmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer,
++                              const VkPushDescriptorSetInfoKHR *pPushDescriptorSetInfo)
++{
++   V3DV_FROM_HANDLE(v3dv_cmd_buffer, cmd_buffer, commandBuffer);
++   V3DV_FROM_HANDLE(v3dv_pipeline_layout, layout,
++                    pPushDescriptorSetInfo->layout);
++
++   const uint32_t set_index = pPushDescriptorSetInfo->set;
++   assert(set_index < MAX_SETS);
++   assert(set_index < layout->num_sets);
++
++   struct v3dv_descriptor_set_layout *set_layout =
++      layout->set[set_index].layout;
++   assert(set_layout->flags &
++          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT);
++
++   struct v3dv_descriptor_set *set =
++      cmd_buffer_allocate_push_descriptor_set(cmd_buffer, set_layout, set_index);
++   if (!set)
++      return;
++
++   /* Write the pushed descriptors into the new set. We reuse the regular
++    * descriptor update path, redirecting each write to the internal set
++    * (VkWriteDescriptorSet::dstSet is required to be ignored for push
++    * descriptors).
++    */
++   const uint32_t write_count = pPushDescriptorSetInfo->descriptorWriteCount;
++   STACK_ARRAY(VkWriteDescriptorSet, writes, write_count);
++   for (uint32_t i = 0; i < write_count; i++) {
++      writes[i] = pPushDescriptorSetInfo->pDescriptorWrites[i];
++      writes[i].dstSet = v3dv_descriptor_set_to_handle(set);
++   }
++
++   v3dv_UpdateDescriptorSets(v3dv_device_to_handle(cmd_buffer->device),
++                             write_count, writes, 0, NULL);
++
++   STACK_ARRAY_FINISH(writes);
++
++   /* Bind the new set to all bind points selected by stageFlags */
++   if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
++      cmd_buffer_bind_push_descriptor_set(cmd_buffer,
++                                          VK_PIPELINE_BIND_POINT_GRAPHICS,
++                                          set, set_index);
++   }
++
++   if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
++      cmd_buffer_bind_push_descriptor_set(cmd_buffer,
++                                          VK_PIPELINE_BIND_POINT_COMPUTE,
++                                          set, set_index);
++   }
++}
++
++VKAPI_ATTR void VKAPI_CALL
++v3dv_CmdPushDescriptorSetWithTemplate2KHR(
++   VkCommandBuffer commandBuffer,
++   const VkPushDescriptorSetWithTemplateInfoKHR *pPushDescriptorSetWithTemplateInfo)
++{
++   V3DV_FROM_HANDLE(v3dv_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(vk_descriptor_update_template, template,
++                  pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate);
++   V3DV_FROM_HANDLE(v3dv_pipeline_layout, layout,
++                    pPushDescriptorSetWithTemplateInfo->layout);
++
++   assert(template->type ==
++          VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR);
++
++   const uint32_t set_index = pPushDescriptorSetWithTemplateInfo->set;
++   assert(set_index < MAX_SETS);
++   assert(set_index < layout->num_sets);
++
++   struct v3dv_descriptor_set_layout *set_layout =
++      layout->set[set_index].layout;
++   assert(set_layout->flags &
++          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT);
++
++   struct v3dv_descriptor_set *set =
++      cmd_buffer_allocate_push_descriptor_set(cmd_buffer, set_layout, set_index);
++   if (!set)
++      return;
++
++   /* Write the pushed descriptors into the new set reusing the regular
++    * template update path.
++    */
++   v3dv_UpdateDescriptorSetWithTemplate(
++      v3dv_device_to_handle(cmd_buffer->device),
++      v3dv_descriptor_set_to_handle(set),
++      pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate,
++      pPushDescriptorSetWithTemplateInfo->pData);
++
++   cmd_buffer_bind_push_descriptor_set(cmd_buffer, template->bind_point,
++                                       set, set_index);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ v3dv_CmdPushConstants(VkCommandBuffer commandBuffer,
+                       VkPipelineLayout layout,
+-- 
+2.47.3
+

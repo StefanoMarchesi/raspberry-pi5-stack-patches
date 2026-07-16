@@ -1,0 +1,870 @@
+From 28aca5fc0d313ef93ad408c1ba3d5ad156c11818 Mon Sep 17 00:00:00 2001
+From: Stefano Marchesi <marchesi@studioup.it>
+Date: Tue, 14 Jul 2026 11:49:04 +0200
+Subject: [PATCH 4/5] v3dv: estensioni custom per il Pi5 (ROAA,
+ push_descriptor, MRT, BO pooling)
+
+Lavoro nostro rimasto per giorni NON committato: un git checkout accidentale su
+v3dv_cmd_buffer.c ne ha cancellato ~300 righe (recuperabili solo dal binario).
+Committo il resto perche non si ripeta.
+
+NB: v3dv_cmd_buffer.c e INCOMPLETO in questo commit (le sue modifiche sono perse).
+Il binario funzionante e in ~/driver-backup/libvulkan_broadcom.so.FUNZIONANTE-2026-07-14
+(md5 e8aaf586fe60a775d51cb994a4aa38d1) e in /opt/*/lib/*/libvulkan_broadcom.so.GOLD
+---
+ docs/features.txt                         |   4 +-
+ src/broadcom/compiler/nir_to_vir.c        |  30 ++
+ src/broadcom/compiler/vir.c               |  15 +
+ src/broadcom/vulkan/v3dv_cmd_buffer.c     |  13 +
+ src/broadcom/vulkan/v3dv_cmd_buffer.h     |  35 +++
+ src/broadcom/vulkan/v3dv_descriptor_set.c |  64 +++-
+ src/broadcom/vulkan/v3dv_device.c         |  22 ++
+ src/broadcom/vulkan/v3dv_limits.h         |   7 +
+ src/broadcom/vulkan/v3dv_pipeline.c       | 353 ++++++++++++++++++++++
+ src/broadcom/vulkan/v3dv_pipeline.h       |  33 ++
+ src/broadcom/vulkan/v3dv_pipeline_cache.c |   2 +-
+ src/broadcom/vulkan/v3dvx_cmd_buffer.c    |  20 ++
+ 12 files changed, 588 insertions(+), 10 deletions(-)
+
+diff --git a/docs/features.txt b/docs/features.txt
+index a1681c83..8890ed95 100644
+--- a/docs/features.txt
++++ b/docs/features.txt
+@@ -676,7 +676,7 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_EXT_primitives_generated_query                     DONE (anv, hasvk, lvp, nvk, radv, tu, vn)
+   VK_EXT_provoking_vertex                               DONE (anv, hasvk, hk, lvp, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_EXT_queue_family_foreign                           DONE (anv, hasvk, hk, nvk, lvp, panvk, pvr, radv, tu, v3dv, vn)
+-  VK_EXT_rasterization_order_attachment_access          DONE (lvp, tu, vn)
++  VK_EXT_rasterization_order_attachment_access          DONE (lvp, tu, v3dv, vn)
+   VK_EXT_rgba10x6_formats                               DONE (panvk/v11+)
+   VK_EXT_robustness2                                    DONE (anv, hasvk, hk, lvp, nvk, panvk/v10+, pvr, radv, tu, v3dv, vn)
+   VK_EXT_sample_locations                               DONE (anv, hasvk, hk, nvk, radv, tu/a650+, vn, lavapipe)
+@@ -719,7 +719,7 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_AMD_texture_gather_bias_lod                        DONE (anv, radv)
+   VK_ANDROID_external_memory_android_hardware_buffer    DONE (anv, lvp, panvk, radv, tu, v3dv, vn)
+   VK_ANDROID_native_buffer                              DONE (anv, lvp, panvk, radv, tu, v3dv, vn)
+-  VK_ARM_rasterization_order_attachment_access          DONE (lvp, tu, vn)
++  VK_ARM_rasterization_order_attachment_access          DONE (lvp, tu, v3dv, vn)
+   VK_ARM_scheduling_controls                            DONE (panvk/v10+)
+   VK_ARM_shader_core_builtins                           DONE (panvk/v9+)
+   VK_ARM_shader_core_properties                         DONE (panvk/v10+)
+diff --git a/src/broadcom/compiler/nir_to_vir.c b/src/broadcom/compiler/nir_to_vir.c
+index 9bf4ec8e..cd0eaaa8 100644
+--- a/src/broadcom/compiler/nir_to_vir.c
++++ b/src/broadcom/compiler/nir_to_vir.c
+@@ -2592,6 +2592,36 @@ vir_emit_tlb_color_read(struct v3d_compile *c, nir_intrinsic_instr *instr)
+          * switch instead -- see vir_emit_thrsw().
+          */
+         if (!c->emitted_tlb_load) {
++                /* Riscuoti i fetch TMU ancora in coda PRIMA di leggere il tile buffer.
++                 *
++                 * Su V3D un fetch e' asincrono: viene accodato e raccolto (con un thread
++                 * switch) solo al primo uso del risultato. Se quell'uso cade dopo una lettura
++                 * del tile buffer -- il caso tipico di uno shader che fonde col framebuffer e
++                 * campiona una texture -- il thread switch finisce dopo la lettura, e sopra
++                 * (vir_emit_thrsw) siamo costretti a lockare lo scoreboard sul PRIMO thread
++                 * switch invece che sull'ultimo. Il frammento tiene allora il pixel bloccato
++                 * per tutta la durata dei propri fetch, e i frammenti sovrapposti si
++                 * serializzano.
++                 *
++                 * Svuotando la coda qui, il thread switch torna a precedere la lettura e il
++                 * lock resta tardivo. Il lock viene comunque preso prima di ogni accesso al
++                 * tile buffer, come l'hardware richiede: cambia solo QUANDO si riscuotono i
++                 * fetch. Misurato su God of War II: fragment shader col lock anticipato da
++                 * 8/148 a 1/148.
++                 *
++                 * SPENTO DI DEFAULT (opt-in: V3D_TLB_FLUSH_FIRST=1). Elimina davvero la
++                 * serializzazione, ma NON conviene: riscuotere i fetch prima significa anche
++                 * aspettare la memoria prima, cioe' rinunciare al mascheramento della latenza,
++                 * che sul V3D e' tutto. Misurato: God of War II e Shadow of the Colossus
++                 * neutri, DRIV3R -8.5% (il piu' affamato di texture). Resta a disposizione per
++                 * carichi diversi (es. Dolphin, che legge il framebuffer molto piu' spesso).
++                 */
++                static int flush_first = -1;
++                if (flush_first < 0)
++                        flush_first = getenv("V3D_TLB_FLUSH_FIRST") ? 1 : 0;
++                if (flush_first)
++                        ntq_flush_tmu(c);
++
+                 if (!c->last_thrsw_at_top_level)
+                         vir_emit_thrsw(c);
+ 
+diff --git a/src/broadcom/compiler/vir.c b/src/broadcom/compiler/vir.c
+index ca06b450..17cbd101 100644
+--- a/src/broadcom/compiler/vir.c
++++ b/src/broadcom/compiler/vir.c
+@@ -945,6 +945,21 @@ v3d_fs_set_prog_data(struct v3d_compile *c,
+                 c->uses_implicit_point_line_varyings;
+         prog_data->lock_scoreboard_on_first_thrsw =
+                 c->lock_scoreboard_on_first_thrsw;
++
++        /* V3D_SB_STATS=1: quanti fragment shader tengono il pixel bloccato per tutta la
++         * durata dei propri fetch (lock anticipato) contro quanti prendono il lock in fondo.
++         * E' la misura diretta della serializzazione imposta dagli shader che leggono il
++         * framebuffer: se un'applicazione ne ha molti, c'e' un premio da prendere.
++         */
++        if (unlikely(getenv("V3D_SB_STATS"))) {
++                static unsigned early, late;
++                if (c->lock_scoreboard_on_first_thrsw)
++                        early++;
++                else
++                        late++;
++                fprintf(stderr, "[v3d-sb] fs lock: early=%u late=%u (%.0f%% early)\n",
++                        early, late, 100.0 * early / (early + late));
++        }
+         prog_data->force_per_sample_msaa = c->s->info.fs.uses_sample_shading;
+         prog_data->uses_pid = c->fs_uses_primitive_id;
+ }
+diff --git a/src/broadcom/vulkan/v3dv_cmd_buffer.c b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+index 143ffc2d..b47d01c0 100644
+--- a/src/broadcom/vulkan/v3dv_cmd_buffer.c
++++ b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+@@ -1372,6 +1372,19 @@ v3dv_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                          const VkRenderPassBeginInfo *pRenderPassBegin,
+                          const VkSubpassBeginInfo *pSubpassBeginInfo)
+ {
++   if (unlikely(getenv("V3D_RP_STATS"))) {
++      static unsigned n;
++      static unsigned last_report;
++      n++;
++      const VkRect2D *ra = &pRenderPassBegin->renderArea;
++      if (n - last_report >= 200) {
++         last_report = n;
++         fprintf(stderr, "[v3d-rp] render pass #%u  area=%dx%d offset=%d,%d\n",
++                 n, ra->extent.width, ra->extent.height,
++                 ra->offset.x, ra->offset.y);
++      }
++   }
++
+    V3DV_FROM_HANDLE(v3dv_cmd_buffer, cmd_buffer, commandBuffer);
+    V3DV_FROM_HANDLE(v3dv_render_pass, pass, pRenderPassBegin->renderPass);
+    V3DV_FROM_HANDLE(v3dv_framebuffer, framebuffer, pRenderPassBegin->framebuffer);
+diff --git a/src/broadcom/vulkan/v3dv_cmd_buffer.h b/src/broadcom/vulkan/v3dv_cmd_buffer.h
+index ed45c895..a3494513 100644
+--- a/src/broadcom/vulkan/v3dv_cmd_buffer.h
++++ b/src/broadcom/vulkan/v3dv_cmd_buffer.h
+@@ -657,6 +657,41 @@ struct v3dv_cmd_buffer {
+       } query;
+    } meta;
+ 
++   /* Per-command buffer resources for VK_KHR_push_descriptor.
++    *
++    * This is the current descriptor pool from which we allocate the internal
++    * descriptor sets backing vkCmdPushDescriptorSet(2)(KHR). It grows on
++    * demand: when it is exhausted we simply create a new, larger pool. All
++    * these pools are registered as private objects of the command buffer so
++    * they are destroyed when the command buffer is reset or destroyed (the
++    * same lifecycle as the meta descriptor pools above), which guarantees
++    * that pushed descriptor sets live for as long as any job recorded in the
++    * command buffer may reference them.
++    */
++   struct {
++      VkDescriptorPool dspool;
++
++      /* The currently active pushed descriptor set for each set index.
++       *
++       * Per the Vulkan spec, the descriptors set by vkCmdPushDescriptorSet
++       * persist and accumulate across multiple push calls to the same set
++       * number until they are disturbed (e.g. a regular vkCmdBindDescriptorSets
++       * to that set number). Applications are allowed to perform partial
++       * pushes that only update a subset of the bindings while relying on
++       * previously pushed bindings remaining valid.
++       *
++       * Because v3dv bakes descriptor state (texture/sampler HW state relocs)
++       * into the command list at draw-record time, we cannot mutate a pushed
++       * set in place once a draw has referenced it. Instead, every push
++       * allocates a fresh internal set (with its own region in the pool BO) and
++       * copies the previously accumulated contents forward before applying the
++       * new writes. These pointers track the last set pushed to each set index
++       * so we can source that copy-forward, and are invalidated (set to NULL)
++       * when a regular descriptor set is bound to the same set number.
++       */
++      struct v3dv_descriptor_set *sets[MAX_SETS];
++   } push_descriptor;
++
+    /* List of jobs in the command buffer. For primary command buffers it
+     * represents the jobs we want to submit to the GPU. For secondary command
+     * buffers it represents jobs that will be merged into a primary command
+diff --git a/src/broadcom/vulkan/v3dv_descriptor_set.c b/src/broadcom/vulkan/v3dv_descriptor_set.c
+index dab7e9e0..d6dd37c5 100644
+--- a/src/broadcom/vulkan/v3dv_descriptor_set.c
++++ b/src/broadcom/vulkan/v3dv_descriptor_set.c
+@@ -653,6 +653,16 @@ v3dv_CreateDescriptorSetLayout(VkDevice _device,
+ 
+    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+ 
++   /* VK_KHR_push_descriptor: we support layouts created with
++    * VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT. There is nothing
++    * special to do here at layout creation time: the flag is stored in
++    * set_layout->flags and descriptor sets with these layouts are allocated
++    * internally, from a per-command buffer descriptor pool, when descriptors
++    * are pushed to a command buffer (see v3dv_CmdPushDescriptorSet2KHR).
++    */
++   ASSERTED const bool push_descriptor_layout =
++      pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
++
+    uint32_t num_bindings = 0;
+    uint32_t immutable_sampler_count = 0;
+ 
+@@ -818,6 +828,15 @@ v3dv_CreateDescriptorSetLayout(VkDevice _device,
+ 
+    free(bindings);
+ 
++   /* From the Vulkan spec, push descriptor set layouts can't include dynamic
++    * buffers or inline uniform blocks and can't exceed maxPushDescriptors.
++    * Enforcing this is the application's responsibility, we just sanity-check
++    * it on debug builds.
++    */
++   assert(!push_descriptor_layout ||
++          (dynamic_offset_count == 0 &&
++           descriptor_count <= MAX_PUSH_DESCRIPTORS));
++
+    set_layout->descriptor_count = descriptor_count;
+    set_layout->dynamic_offset_count = dynamic_offset_count;
+ 
+@@ -963,6 +982,26 @@ descriptor_set_create(struct v3dv_device *device,
+       }
+    }
+ 
++   /* Defensive hardening: initialize the descriptor type of every slot from
++    * the layout. Descriptor sets are otherwise zero-initialized, so an
++    * unwritten slot reports type 0 (VK_DESCRIPTOR_TYPE_SAMPLER), which makes
++    * the recorded descriptor state ambiguous if a shader ever reads a slot
++    * that was never written (which is undefined behavior per the Vulkan spec).
++    * This does not by itself make sampling an unwritten slot valid (the
++    * image_view/buffer_view pointers are still NULL), but keeps the stored
++    * descriptor type consistent with the layout for anything that inspects it.
++    */
++   for (uint32_t b = 0; b < layout->binding_count; b++) {
++      const struct v3dv_descriptor_set_binding_layout *bl = &layout->binding[b];
++      /* Inline uniform blocks encode their byte size in array_size but only
++       * occupy a single descriptor slot, so clamp to one entry for them.
++       */
++      uint32_t slots = bl->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
++                       1 : bl->array_size;
++      for (uint32_t i = 0; i < slots; i++)
++         set->descriptors[bl->descriptor_index + i].type = bl->type;
++   }
++
+    v3dv_descriptor_set_layout_ref(layout);
+    list_addtail(&set->pool_link, &pool->set_list);
+ 
+@@ -1208,14 +1247,25 @@ v3dv_UpdateDescriptorSets(VkDevice  _device,
+             break;
+          }
+          case VK_DESCRIPTOR_TYPE_SAMPLER: {
+-            /* If we are here we shouldn't be modifying an immutable sampler */
+-            assert(!binding_layout->immutable_samplers_offset);
+-            const VkDescriptorImageInfo *image_info = writeset->pImageInfo + j;
+-            V3DV_FROM_HANDLE(v3dv_sampler, sampler, image_info->sampler);
++            /* If the binding uses immutable samplers, the sampler handle in
++             * the write is ignored per the Vulkan spec: the immutable sampler
++             * was already baked into the set's BO at set-creation time (see
++             * the immutable-sampler copy in descriptor_set_create). A regular
++             * descriptor set never reaches this path because the spec forbids
++             * the app from writing the sampler of an immutable-sampler binding,
++             * but push descriptor sets funnel the app's writes through
++             * v3dv_UpdateDescriptorSets, where such a write is legal and must
++             * be a no-op for the sampler. Skip overwriting it (and don't deref
++             * the ignored, possibly VK_NULL_HANDLE, sampler handle).
++             */
++            if (!binding_layout->immutable_samplers_offset) {
++               const VkDescriptorImageInfo *image_info = writeset->pImageInfo + j;
++               V3DV_FROM_HANDLE(v3dv_sampler, sampler, image_info->sampler);
+ 
+-            write_image_descriptor(device, descriptor, writeset->descriptorType,
+-                                   set, binding_layout, NULL, sampler,
+-                                   writeset->dstArrayElement + j);
++               write_image_descriptor(device, descriptor, writeset->descriptorType,
++                                      set, binding_layout, NULL, sampler,
++                                      writeset->dstArrayElement + j);
++            }
+ 
+             break;
+          }
+diff --git a/src/broadcom/vulkan/v3dv_device.c b/src/broadcom/vulkan/v3dv_device.c
+index c79488ea..b64d63d3 100644
+--- a/src/broadcom/vulkan/v3dv_device.c
++++ b/src/broadcom/vulkan/v3dv_device.c
+@@ -184,6 +184,7 @@ get_device_extensions(const struct v3dv_physical_device *device,
+       .KHR_maintenance5                     = true,
+       .KHR_multiview                        = true,
+       .KHR_pipeline_executable_properties   = true,
++      .KHR_push_descriptor                  = true,
+       .KHR_separate_depth_stencil_layouts   = true,
+       .KHR_shader_expect_assume             = true,
+       .KHR_shader_float_controls            = true,
+@@ -245,6 +246,7 @@ get_device_extensions(const struct v3dv_physical_device *device,
+       .EXT_private_data                     = true,
+       .EXT_provoking_vertex                 = true,
+       .EXT_queue_family_foreign             = true,
++      .EXT_rasterization_order_attachment_access = true,
+       .EXT_separate_stencil_usage           = true,
+       .EXT_shader_demote_to_helper_invocation = true,
+       .EXT_shader_module_identifier         = true,
+@@ -255,6 +257,7 @@ get_device_extensions(const struct v3dv_physical_device *device,
+       .EXT_texel_buffer_alignment           = true,
+       .EXT_tooling_info                     = true,
+       .EXT_vertex_attribute_divisor         = true,
++      .ARM_rasterization_order_attachment_access = true,
+    };
+ #if DETECT_OS_ANDROID
+    struct u_gralloc *gralloc = vk_android_get_ugralloc();
+@@ -465,6 +468,19 @@ get_features(const struct v3dv_physical_device *physical_device,
+       /* FIXME: update when supporting EXT_transform_feedback */
+       .transformFeedbackPreservesProvokingVertex = false,
+ 
++      /* VK_EXT_rasterization_order_attachment_access
++       *
++       * We only expose the color aspect: TLB color reads are executed
++       * after the per-pixel scoreboard lock has been acquired, so they
++       * observe the results of all overlapping fragments that were
++       * rasterized earlier, which is exactly the guarantee this feature
++       * requires. There is no equivalent TLB *read* path for depth or
++       * stencil, so those aspects are not supported.
++       */
++      .rasterizationOrderColorAttachmentAccess = true,
++      .rasterizationOrderDepthAttachmentAccess = false,
++      .rasterizationOrderStencilAttachmentAccess = false,
++
+       /* VK_EXT_vertex_attribute_divisor */
+       .vertexAttributeInstanceRateDivisor = true,
+       .vertexAttributeInstanceRateZeroDivisor = false,
+@@ -528,6 +544,9 @@ get_features(const struct v3dv_physical_device *physical_device,
+       /* VK_KHR_maintenance5 */
+       .maintenance5 = true,
+ 
++      /* VK_KHR_push_descriptor (feature added on promotion to Vulkan 1.4) */
++      .pushDescriptor = true,
++
+ #ifdef V3DV_USE_WSI_PLATFORM
+       /* VK_KHR_swapchain_maintenance1 */
+       .swapchainMaintenance1 = true,
+@@ -1288,6 +1307,9 @@ get_device_properties(const struct v3dv_physical_device *device,
+       .polygonModePointSize = true,
+       .nonStrictSinglePixelWideLinesUseParallelogram = true,
+       .nonStrictWideLinesUseParallelogram = true,
++
++      /* VK_KHR_push_descriptor */
++      .maxPushDescriptors = MAX_PUSH_DESCRIPTORS,
+    };
+ 
+    /* VkPhysicalDeviceShaderModuleIdentifierPropertiesEXT */
+diff --git a/src/broadcom/vulkan/v3dv_limits.h b/src/broadcom/vulkan/v3dv_limits.h
+index 482cb813..91f2b434 100644
+--- a/src/broadcom/vulkan/v3dv_limits.h
++++ b/src/broadcom/vulkan/v3dv_limits.h
+@@ -37,6 +37,13 @@
+ 
+ #define MAX_SETS 16
+ 
++/* Maximum number of descriptors that can be pushed to a descriptor set
++ * with vkCmdPushDescriptorSet (VK_KHR_push_descriptor). 32 is the minimum
++ * required by the extension and the de-facto standard value advertised by
++ * most implementations.
++ */
++#define MAX_PUSH_DESCRIPTORS 32
++
+ #define MAX_PUSH_CONSTANTS_SIZE 128
+ 
+ #define MAX_SAMPLED_IMAGES 16
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.c b/src/broadcom/vulkan/v3dv_pipeline.c
+index 6799cb19..99d71e90 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline.c
++++ b/src/broadcom/vulkan/v3dv_pipeline.c
+@@ -35,9 +35,11 @@
+ #include "qpu/qpu_disasm.h"
+ 
+ #include "compiler/nir/nir_builder.h"
++#include "compiler/nir/nir_format_convert.h"
+ #include "compiler/nir/nir_lower_blend.h"
+ #include "nir/nir_serialize.h"
+ 
++#include "util/bitscan.h"
+ #include "util/format/u_format.h"
+ #include "util/shader_stats.h"
+ #include "util/os_time.h"
+@@ -956,6 +958,337 @@ lower_fs_io(nir_shader *nir)
+             type_size_vec4, 0);
+ }
+ 
++/* VK_EXT_rasterization_order_attachment_access (color)
++ *
++ * When a subpass color attachment is aliased by an input attachment and the
++ * pipeline was created with
++ * VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT,
++ * loads from that input attachment must observe, in rasterization order, the
++ * color writes of all overlapping fragments rasterized earlier, without any
++ * pipeline barrier between them.
++ *
++ * On V3D we get this guarantee for free from the TLB: TLB color reads are
++ * always executed after the per-pixel scoreboard lock has been acquired (see
++ * vir_emit_tlb_color_read() in nir_to_vir.c), which serializes overlapping
++ * fragments in rasterization order. This is the same mechanism the GL driver
++ * uses for coherent framebuffer fetch and that we already use for software
++ * blending (dual-source blend).
++ *
++ * So, instead of lowering these input attachment loads to texel fetches from
++ * memory (which within the render pass would return stale data since the
++ * current color values live in the tile buffer), we lower them to
++ * nir_load_tlb_color_brcm intrinsics on the aliased render target.
++ *
++ * This pass must run *before* pipeline_lower_nir(), while the texel fetches
++ * produced by nir_lower_input_attachments() still carry a texture deref to
++ * the original input attachment variable (whose data.index holds the input
++ * attachment index).
++ */
++/* State threaded through the input-attachment lowering callback so we can
++ * record which render targets the fragment shader actually reads (as opposed
++ * to the ones that are merely aliased in roaa_map).
++ */
++struct roaa_lower_state {
++   struct v3dv_pipeline *pipeline;
++   uint32_t read_rts;
++};
++
++static nir_def *
++roaa_load_tlb_color(nir_builder *b, unsigned rt, unsigned sample)
++{
++   nir_def *comps[4];
++   for (unsigned i = 0; i < 4; i++) {
++      comps[i] = nir_load_tlb_color_brcm(b, 1, 32, nir_imm_int(b, rt),
++                                         .base = sample, .component = i);
++   }
++   return nir_vec(b, comps, 4);
++}
++
++/* For 16-bit normalized formats the TLB read returns the raw integer values
++ * (these RTs are marked f32_color_rb in the FS key, see
++ * v3d_fs_key_set_color_attachment()), so we need to convert them to float,
++ * mirroring what lower_16bit_norm() in vir.c does for load_output. We use the
++ * portable software conversion helpers, which are correct on all HW versions.
++ */
++static nir_def *
++roaa_convert_norm16(nir_builder *b, struct v3dv_pipeline *pipeline,
++                    unsigned rt, nir_def *out)
++{
++   VkFormat vk_format = pipeline->rendering_info.color_attachment_formats[rt];
++   assert(vk_format != VK_FORMAT_UNDEFINED);
++   const struct util_format_description *desc = vk_format_description(vk_format);
++   if ((desc->is_unorm || desc->is_snorm) && desc->channel[0].size == 16) {
++      static const unsigned bits_16[4] = {16, 16, 16, 16};
++      out = desc->is_snorm ? nir_format_snorm_to_float(b, out, bits_16) :
++                             nir_format_unorm_to_float(b, out, bits_16);
++   }
++   return out;
++}
++
++static bool
++lower_roaa_input_attachment_cb(nir_builder *b, nir_instr *instr, void *data)
++{
++   struct roaa_lower_state *state = data;
++   struct v3dv_pipeline *pipeline = state->pipeline;
++
++   if (instr->type != nir_instr_type_tex)
++      return false;
++
++   nir_tex_instr *tex = nir_instr_as_tex(instr);
++   if (tex->op != nir_texop_txf)
++      return false;
++
++   /* Input attachment loads keep their subpass sampler dim after
++    * nir_lower_input_attachments().
++    */
++   if (tex->sampler_dim != GLSL_SAMPLER_DIM_SUBPASS &&
++       tex->sampler_dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
++      return false;
++
++   /* Sparse loads and non 32-bit destinations keep the memory path */
++   if (tex->is_sparse || tex->def.bit_size != 32)
++      return false;
++
++   int deref_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
++   if (deref_idx < 0)
++      return false;
++
++   nir_deref_instr *deref = nir_src_as_deref(tex->src[deref_idx].src);
++   nir_variable *var = nir_deref_instr_get_variable(deref);
++   if (!var)
++      return false;
++
++   /* var->data.index is the InputAttachmentIndex decoration. For arrays of
++    * subpass inputs we can only handle constant indexing; dynamic indexing
++    * keeps the memory path.
++    */
++   uint32_t ia_index = var->data.index;
++   if (deref->deref_type == nir_deref_type_array) {
++      if (!nir_src_is_const(deref->arr.index))
++         return false;
++      ia_index += nir_src_as_uint(deref->arr.index);
++   }
++
++   if (ia_index >= ARRAY_SIZE(pipeline->roaa_map))
++      return false;
++
++   const uint8_t rt = pipeline->roaa_map[ia_index];
++   if (rt == V3DV_ROAA_UNUSED)
++      return false;
++
++   assert(rt < V3D_MAX_DRAW_BUFFERS);
++
++   /* Record that the shader really reads this RT through the TLB, so we can
++    * make sure a matching TLB color *write* is emitted for it (which is what
++    * releases the per-pixel scoreboard lock the read acquired).
++    */
++   state->read_rts |= 1u << rt;
++
++   b->cursor = nir_before_instr(instr);
++
++   /* Input attachment reads are only defined at the current fragment
++    * location (x, y, layer), which is exactly what the TLB read returns,
++    * so we can ignore the texel coordinates here.
++    *
++    * For multisampled targets the TLB holds all the samples of the
++    * current pixel and nir_load_tlb_color_brcm selects one with its base
++    * index, so we honor the sample index requested by the shader with a
++    * select chain (the backend reads all the samples from the TLB on the
++    * first read and caches them, so the extra loads are just MOVs).
++    */
++   nir_def *out = roaa_load_tlb_color(b, rt, 0);
++   if (pipeline->msaa) {
++      int ms_idx = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
++      if (ms_idx >= 0) {
++         nir_def *sample = tex->src[ms_idx].src.ssa;
++         for (unsigned i = 1; i < V3D_MAX_SAMPLES; i++) {
++            out = nir_bcsel(b, nir_ieq_imm(b, sample, i),
++                            roaa_load_tlb_color(b, rt, i), out);
++         }
++      }
++   }
++
++   out = roaa_convert_norm16(b, pipeline, rt, out);
++
++   if (tex->def.num_components < 4)
++      out = nir_trim_vector(b, out, tex->def.num_components);
++
++   b->shader->info.fs.uses_fbfetch_output = true;
++
++   nir_def_replace(&tex->def, out);
++   return true;
++}
++
++/* Returns the mask of color render targets the fragment shader already writes
++ * (has a real store to), so we don't add a redundant pseudo-write that would
++ * clobber the application's output. At this point in the pipeline (before
++ * lower_fs_io()) fragment outputs are still variable stores (store_deref);
++ * we also handle store_output defensively.
++ */
++static uint32_t
++roaa_written_rts(nir_shader *nir)
++{
++   uint32_t written = 0;
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            int location = -1;
++
++            if (intr->intrinsic == nir_intrinsic_store_deref) {
++               nir_variable *var =
++                  nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
++               if (var && var->data.mode == nir_var_shader_out &&
++                   var->data.index == 0)
++                  location = var->data.location;
++            } else if (intr->intrinsic == nir_intrinsic_store_output) {
++               location = nir_intrinsic_io_semantics(intr).location;
++            }
++
++            if (location >= FRAG_RESULT_DATA0 &&
++                location <= FRAG_RESULT_DATA7)
++               written |= 1u << (location - FRAG_RESULT_DATA0);
++         }
++      }
++   }
++
++   return written;
++}
++
++/* Finds the existing nir_var_shader_out for a given color RT, or creates one
++ * (a plain vec4 FRAG_RESULT_DATA0+rt output) if none exists.
++ */
++static nir_variable *
++roaa_get_or_create_output(nir_shader *nir, unsigned rt)
++{
++   nir_foreach_shader_out_variable(var, nir) {
++      if (var->data.index == 0 &&
++          var->data.location == (int)(FRAG_RESULT_DATA0 + rt))
++         return var;
++   }
++
++   char name[16];
++   snprintf(name, sizeof(name), "roaa_out%u", rt);
++   nir_variable *var =
++      nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), name);
++   var->data.location = FRAG_RESULT_DATA0 + rt;
++   var->data.index = 0;
++   return var;
++}
++
++static void
++lower_roaa_input_attachments(nir_shader *nir, struct v3dv_pipeline *pipeline)
++{
++   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
++
++   bool any_aliased = false;
++   for (unsigned i = 0; i < ARRAY_SIZE(pipeline->roaa_map); i++)
++      any_aliased |= pipeline->roaa_map[i] != V3DV_ROAA_UNUSED;
++
++   if (!any_aliased)
++      return;
++
++   struct roaa_lower_state state = {
++      .pipeline = pipeline,
++      .read_rts = 0,
++   };
++
++   bool progress = false;
++   NIR_PASS(progress, nir, nir_shader_instructions_pass,
++            lower_roaa_input_attachment_cb, nir_metadata_control_flow,
++            &state);
++
++   if (!progress)
++      return;
++
++   /* Clean up the dead derefs so descriptor lowering doesn't see them */
++   NIR_PASS(_, nir, nir_opt_dce);
++
++   /* On V3D a fragment shader that does a TLB color *read* acquires the
++    * per-pixel scoreboard lock, and that lock is only released by a TLB color
++    * *write* (vir_emit_tlb_color_write(), driven by a store_output). Every
++    * proven TLB-read consumer (GL framebuffer fetch, v3dv software blending)
++    * also writes the render target, so the lock is always released.
++    *
++    * VK_EXT_rasterization_order_attachment_access lets a shader read a color
++    * attachment (through an aliased input attachment) that it never writes.
++    * Without a matching color write the scoreboard lock is acquired but never
++    * released and the GPU hangs (V3D_ERR_STAT bit 12).
++    *
++    * So for every RT we turned into a TLB read but the shader does not
++    * already write, synthesize a color output that writes the value we just
++    * read back to the TLB. This is a content-preserving (identity) write --
++    * exactly what software blending does with an identity blend function --
++    * so it cannot corrupt the attachment, while still emitting the TLB write
++    * that releases the scoreboard lock and setting up the per-RT TLB config
++    * and threading identically to the proven software_blend path.
++    */
++   uint32_t written = roaa_written_rts(nir);
++   uint32_t pending = state.read_rts & ~written;
++
++   if (pending) {
++      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++      nir_builder b = nir_builder_at(nir_after_impl(impl));
++
++      u_foreach_bit(rt, pending) {
++         nir_variable *var = roaa_get_or_create_output(nir, rt);
++         nir_def *val = roaa_convert_norm16(&b, pipeline, rt,
++                                            roaa_load_tlb_color(&b, rt, 0));
++         nir_store_var(&b, var, val, 0xf);
++      }
++
++      nir->info.fs.uses_fbfetch_output = true;
++      nir_progress(true, impl, nir_metadata_control_flow);
++   }
++}
++
++/* Fills pipeline->roaa_map. Only pipelines created against a render pass
++ * object can use rasterization order attachment access on this driver:
++ * with dynamic rendering, input attachments would require
++ * VK_KHR_dynamic_rendering_local_read, which we don't support.
++ */
++static void
++pipeline_setup_roaa_map(struct v3dv_pipeline *pipeline,
++                        const VkGraphicsPipelineCreateInfo *pCreateInfo)
++{
++   memset(pipeline->roaa_map, V3DV_ROAA_UNUSED, sizeof(pipeline->roaa_map));
++
++   if (!pipeline->pass || !pipeline->subpass)
++      return;
++
++   /* pColorBlendState must be ignored when rasterization is disabled */
++   if (!pipeline->rasterization_enabled)
++      return;
++
++   const VkPipelineColorBlendStateCreateInfo *cb = pCreateInfo->pColorBlendState;
++   if (!cb ||
++       !(cb->flags &
++         VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT)) {
++      return;
++   }
++
++   const struct v3dv_subpass *subpass = pipeline->subpass;
++   for (uint32_t i = 0; i < subpass->input_count; i++) {
++      if (i >= ARRAY_SIZE(pipeline->roaa_map))
++         break;
++
++      const uint32_t att = subpass->input_attachments[i].attachment;
++      if (att == VK_ATTACHMENT_UNUSED)
++         continue;
++
++      for (uint32_t j = 0; j < subpass->color_count; j++) {
++         if (subpass->color_attachments[j].attachment == att) {
++            pipeline->roaa_map[i] = j;
++            break;
++         }
++      }
++   }
++}
++
+ static void
+ lower_gs_io(struct nir_shader *nir)
+ {
+@@ -2023,6 +2356,12 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
+ 
+    key->software_blend = pipeline->blend.use_software;
+ 
++   /* VK_EXT_rasterization_order_attachment_access changes how we lower
++    * input attachment loads in the fragment shader.
++    */
++   STATIC_ASSERT(sizeof(key->roaa_map) == sizeof(pipeline->roaa_map));
++   memcpy(key->roaa_map, pipeline->roaa_map, sizeof(key->roaa_map));
++
+    struct vk_render_pass_state *ri = &pipeline->rendering_info;
+    for (uint32_t i = 0; i < ri->color_attachment_count; i++) {
+       if (ri->color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
+@@ -2435,6 +2774,13 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
+    struct v3dv_device *device = pipeline->device;
+    struct v3dv_physical_device *physical_device = device->pdevice;
+ 
++   /* VK_EXT_rasterization_order_attachment_access: compute the input
++    * attachment -> aliased color RT map. This must happen before we
++    * compute the pipeline hash since it affects how we lower the
++    * fragment shader.
++    */
++   pipeline_setup_roaa_map(pipeline, pCreateInfo);
++
+    /* First pass to get some common info from the shader, and create the
+     * individual pipeline_stage objects
+     */
+@@ -2611,6 +2957,13 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
+       link_shaders(p_stage_vs->nir, p_stage_fs->nir);
+    }
+ 
++   /* VK_EXT_rasterization_order_attachment_access: turn input attachment
++    * loads that alias color attachments of the subpass into TLB color
++    * reads. Must run before pipeline_lower_nir() so we still see the
++    * input attachment derefs.
++    */
++   lower_roaa_input_attachments(p_stage_fs->nir, pipeline);
++
+    pipeline_lower_nir(pipeline, p_stage_fs, pipeline->layout);
+    lower_fs_io(p_stage_fs->nir);
+ 
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.h b/src/broadcom/vulkan/v3dv_pipeline.h
+index 5a66de7c..48c6ec12 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline.h
++++ b/src/broadcom/vulkan/v3dv_pipeline.h
+@@ -43,6 +43,20 @@ struct vk_shader_module;
+ struct nir_shader;
+ struct nir_shader_compiler_options;
+ 
++/* Maximum number of subpass input attachment slots we track for
++ * VK_EXT_rasterization_order_attachment_access. Input attachment indices
++ * beyond this are left on the regular (memory) input attachment path.
++ * Note this is larger than MAX_INPUT_ATTACHMENTS (our per-stage descriptor
++ * limit) because input attachment *indices* refer to slots in the subpass
++ * description, which may contain more entries than a shader can access.
++ */
++#define V3DV_MAX_ROAA_INPUT_ATTACHMENTS 8
++
++/* Value in roaa_map[] meaning "input attachment does not alias any color
++ * attachment of the subpass (or rasterization order access is disabled)".
++ */
++#define V3DV_ROAA_UNUSED 0xff
++
+ struct v3dv_pipeline_key {
+    uint8_t topology;
+    uint8_t logicop_func;
+@@ -69,6 +83,13 @@ struct v3dv_pipeline_key {
+    uint32_t va_swap_rb_mask;
+    bool has_multiview;
+    bool line_smooth;
++   /* VK_EXT_rasterization_order_attachment_access: per input attachment
++    * index, the color RT it aliases in the pipeline's subpass
++    * (V3DV_ROAA_UNUSED if none). This changes how we lower input
++    * attachment loads in the fragment shader, so it must be part of the
++    * pipeline hash.
++    */
++   uint8_t roaa_map[V3DV_MAX_ROAA_INPUT_ATTACHMENTS];
+ };
+ 
+ struct v3dv_pipeline_cache_stats {
+@@ -433,6 +454,18 @@ struct v3dv_pipeline {
+       uint32_t color_write_masks;
+    } blend;
+ 
++   /* VK_EXT_rasterization_order_attachment_access (color aspect only).
++    *
++    * For each input attachment index used by the fragment shader, the
++    * color RT of the pipeline's subpass it aliases, or V3DV_ROAA_UNUSED.
++    * Only populated when the pipeline was created with
++    * VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT
++    * against a render pass object. Aliased input attachment loads are
++    * lowered to TLB color reads (raster-order safe) instead of memory
++    * reads.
++    */
++   uint8_t roaa_map[V3DV_MAX_ROAA_INPUT_ATTACHMENTS];
++
+    struct {
+       void *mem_ctx;
+       struct util_dynarray data; /* Array of v3dv_pipeline_executable_data */
+diff --git a/src/broadcom/vulkan/v3dv_pipeline_cache.c b/src/broadcom/vulkan/v3dv_pipeline_cache.c
+index 96e9b539..e20f4f77 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline_cache.c
++++ b/src/broadcom/vulkan/v3dv_pipeline_cache.c
+@@ -34,7 +34,7 @@ static const bool dump_stats = false;
+ static const bool dump_stats_on_destroy = false;
+ 
+ /* Shared for nir/variants */
+-#define V3DV_MAX_PIPELINE_CACHE_ENTRIES 4096
++#define V3DV_MAX_PIPELINE_CACHE_ENTRIES 16384
+ 
+ static uint32_t
+ blake3_hash_func(const void *blake3)
+diff --git a/src/broadcom/vulkan/v3dvx_cmd_buffer.c b/src/broadcom/vulkan/v3dvx_cmd_buffer.c
+index cd5dc167..7c80a314 100644
+--- a/src/broadcom/vulkan/v3dvx_cmd_buffer.c
++++ b/src/broadcom/vulkan/v3dvx_cmd_buffer.c
+@@ -2432,6 +2432,26 @@ v3dX(cmd_buffer_emit_gl_shader_state)(struct v3dv_cmd_buffer *cmd_buffer)
+    struct v3dv_pipeline *pipeline = state->gfx.pipeline;
+    assert(pipeline);
+ 
++   /* Defense-in-depth: a mis-keyed or failed shader compile (for example a
++    * pipeline whose blend/format config could not be honoured) can leave the
++    * pipeline without valid shared data or shader variants. Every deref below
++    * (shared_data->assembly_bo, variant->prog_data, variant->assembly_offset)
++    * is otherwise unguarded and, with asserts compiled out in release builds,
++    * would segfault the driver while emitting the draw. Flag the command
++    * buffer and skip the draw instead of faulting. */
++   if (unlikely(!pipeline->shared_data ||
++                !pipeline->shared_data->assembly_bo ||
++                !pipeline->shared_data->variants[BROADCOM_SHADER_VERTEX] ||
++                !pipeline->shared_data->variants[BROADCOM_SHADER_VERTEX_BIN] ||
++                !pipeline->shared_data->variants[BROADCOM_SHADER_FRAGMENT] ||
++                (pipeline->has_gs &&
++                 (!pipeline->shared_data->variants[BROADCOM_SHADER_GEOMETRY] ||
++                  !pipeline->shared_data->variants[BROADCOM_SHADER_GEOMETRY_BIN])))) {
++      assert(!"v3dv: missing shader variant or shared data at draw emission");
++      v3dv_flag_oom(cmd_buffer, NULL);
++      return;
++   }
++
+    struct v3dv_shader_variant *vs_variant =
+       pipeline->shared_data->variants[BROADCOM_SHADER_VERTEX];
+    struct v3d_vs_prog_data *prog_data_vs = vs_variant->prog_data.vs;
+-- 
+2.47.3
+

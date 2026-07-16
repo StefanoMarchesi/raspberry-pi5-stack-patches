@@ -1,0 +1,5 @@
+b42d83b9301337bc275b9e8a474a7966d92cc9f9a9d3971e4f0bf4f81d07e9f8  0001-v3dv-route-blending-of-UNORM16-SNORM16-RTs-through-s.patch
+0dc6fca30802fac9a67b6821f2edc6a57052cef92599810a4add9106526d9583  0002-v3dv-rename-format_plane-unorm-snorm-flags-to-sw_uno.patch
+a73bae48a4d13d6499e6323e9fd2775e76d0350e4f08ff1b61315726f8c49401  0003-v3d-expose-seamless_cube_map-cap-enables-GL-3.3-core.patch
+a0342e6b917d9b9e54710a0b07b42cff150779288ac77e33cdbf4d131aacd76b  0004-v3dv-estensioni-custom-per-il-Pi5-ROAA-push_descript.patch
+b26934ce5e84b6a9dc204f184bb46c73122fec207794c154aacb4543a347e9cd  0005-v3dv-ripristina-push_descriptor-in-v3dv_cmd_buffer.c.patch

@@ -1,0 +1,80 @@
+From a4fd721eaecf22e96400a55ac37b9c44824fd42a Mon Sep 17 00:00:00 2001
+From: Jose Maria Casanova Crespo <jmcasanova@igalia.com>
+Date: Mon, 15 Jun 2026 14:49:58 +0200
+Subject: [PATCH 2/5] v3dv: rename format_plane unorm/snorm flags to
+ sw_unorm/sw_snorm
+
+Reviewed-by: Iago Toral Quiroga <itoral@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42176>
+---
+ src/broadcom/vulkan/v3dv_format_table.h | 4 ++--
+ src/broadcom/vulkan/v3dvx_device.c      | 4 ++--
+ src/broadcom/vulkan/v3dvx_formats.c     | 2 +-
+ src/broadcom/vulkan/v3dvx_pipeline.c    | 2 +-
+ 4 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/broadcom/vulkan/v3dv_format_table.h b/src/broadcom/vulkan/v3dv_format_table.h
+index cb4d34ea..03b9f2a3 100644
+--- a/src/broadcom/vulkan/v3dv_format_table.h
++++ b/src/broadcom/vulkan/v3dv_format_table.h
+@@ -63,10 +63,10 @@ struct v3dv_format_plane {
+    uint8_t return_size;
+ 
+    /* Needs software unorm packing */
+-   bool unorm;
++   bool sw_unorm;
+ 
+    /* Needs software snorm packing */
+-   bool snorm;
++   bool sw_snorm;
+ };
+ 
+ struct v3dv_format {
+diff --git a/src/broadcom/vulkan/v3dvx_device.c b/src/broadcom/vulkan/v3dvx_device.c
+index ceeda4b3..c70d5a5b 100644
+--- a/src/broadcom/vulkan/v3dvx_device.c
++++ b/src/broadcom/vulkan/v3dvx_device.c
+@@ -384,12 +384,12 @@ v3dX(get_hw_clear_color)(const VkClearColorValue *color,
+    break;
+    case V3D_INTERNAL_TYPE_16UI:
+    case V3D_INTERNAL_TYPE_16I:
+-      if (format->unorm) {
++      if (format->sw_unorm) {
+          util_pack_color(color->float32, PIPE_FORMAT_R16G16B16A16_UNORM, &uc);
+          memcpy(hw_color, uc.ui, internal_size);
+          return;
+       }
+-      if (format->snorm) {
++      if (format->sw_snorm) {
+          util_pack_color(color->float32, PIPE_FORMAT_R16G16B16A16_SNORM, &uc);
+          memcpy(hw_color, uc.ui, internal_size);
+          return;
+diff --git a/src/broadcom/vulkan/v3dvx_formats.c b/src/broadcom/vulkan/v3dvx_formats.c
+index b5efe005..089d7734 100644
+--- a/src/broadcom/vulkan/v3dvx_formats.c
++++ b/src/broadcom/vulkan/v3dvx_formats.c
+@@ -491,7 +491,7 @@ v3dX(format_supports_blending)(const struct v3dv_format *format)
+     * HW can't blend, but the compiler lowers blending in NIR for them, so
+     * we still expose VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT.
+     */
+-   if (format->planes[0].unorm || format->planes[0].snorm)
++   if (format->planes[0].sw_unorm || format->planes[0].sw_snorm)
+       return true;
+ 
+    /* Hardware blending is only supported on render targets that are configured
+diff --git a/src/broadcom/vulkan/v3dvx_pipeline.c b/src/broadcom/vulkan/v3dvx_pipeline.c
+index a42f1214..4aef71fc 100644
+--- a/src/broadcom/vulkan/v3dvx_pipeline.c
++++ b/src/broadcom/vulkan/v3dvx_pipeline.c
+@@ -124,7 +124,7 @@ pack_blend(struct v3dv_pipeline *pipeline,
+        * integer (used for our software-packed UNORM16/SNORM16 formats).
+        * Fall back to NIR-lowered blending for those attachments.
+        */
+-      if (format->planes[0].unorm || format->planes[0].snorm)
++      if (format->planes[0].sw_unorm || format->planes[0].sw_snorm)
+          needs_software_blend = true;
+ 
+       uint8_t rt_mask = 1 << i;
+-- 
+2.47.3
+

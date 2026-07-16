@@ -1,0 +1,86 @@
+From 8e9cf999fac20bf42c97136d2600019fd3813b20 Mon Sep 17 00:00:00 2001
+From: Jose Maria Casanova Crespo <jmcasanova@igalia.com>
+Date: Thu, 21 May 2026 00:15:43 +0200
+Subject: [PATCH 1/5] v3dv: route blending of UNORM16/SNORM16 RTs through
+ software lowering
+
+UNORM16/SNORM16 render targets are backed by 16-bit-integer TLB
+formats, which V3D HW cannot blend. The compiler already supports
+software blend lowering in NIR, but V3DV only enabled it for dual-src
+blending. As a result format_supports_blending refused the BLEND_BIT
+for these formats and Dawn could not advertise the WebGPU
+Unorm16TextureFormats feature.
+
+Set pipeline->blend.use_software when any color attachment uses a
+software-normalised format so the existing NIR blend lowering kicks
+in, and expose VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT for
+those formats.
+
+Assisted-by: Claude Opus 4.7
+Reviewed-by: Iago Toral Quiroga <itoral@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42176>
+---
+ src/broadcom/vulkan/v3dvx_formats.c  |  7 +++++++
+ src/broadcom/vulkan/v3dvx_pipeline.c | 14 ++++++++++----
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/broadcom/vulkan/v3dvx_formats.c b/src/broadcom/vulkan/v3dvx_formats.c
+index cd93f6bf..b5efe005 100644
+--- a/src/broadcom/vulkan/v3dvx_formats.c
++++ b/src/broadcom/vulkan/v3dvx_formats.c
+@@ -487,6 +487,13 @@ v3dX(format_supports_blending)(const struct v3dv_format *format)
+    if (!format->plane_count || format->plane_count > 1)
+       return false;
+ 
++   /* Software-emulated UNORM16/SNORM16 RTs use 16-bit-integer storage which
++    * HW can't blend, but the compiler lowers blending in NIR for them, so
++    * we still expose VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT.
++    */
++   if (format->planes[0].unorm || format->planes[0].snorm)
++      return true;
++
+    /* Hardware blending is only supported on render targets that are configured
+     * 4x8-bit unorm, 2x16-bit float or 4x16-bit float.
+     */
+diff --git a/src/broadcom/vulkan/v3dvx_pipeline.c b/src/broadcom/vulkan/v3dvx_pipeline.c
+index 1656ea81..a42f1214 100644
+--- a/src/broadcom/vulkan/v3dvx_pipeline.c
++++ b/src/broadcom/vulkan/v3dvx_pipeline.c
+@@ -97,6 +97,7 @@ pack_blend(struct v3dv_pipeline *pipeline,
+    uint32_t color_write_masks = 0;
+ 
+    bool needs_dual_src = false;
++   bool needs_software_blend = false;
+    for (uint32_t i = 0; i < ri->color_attachment_count; i++) {
+       const struct vk_color_blend_attachment_state *b_state =
+          &cb->attachments[i];
+@@ -119,6 +120,13 @@ pack_blend(struct v3dv_pipeline *pipeline,
+       assert(format->plane_count == 1);
+       bool dst_alpha_one = (format->planes[0].swizzle[3] == PIPE_SWIZZLE_1);
+ 
++      /* HW blend cannot operate on render targets configured as 16-bit
++       * integer (used for our software-packed UNORM16/SNORM16 formats).
++       * Fall back to NIR-lowered blending for those attachments.
++       */
++      if (format->planes[0].unorm || format->planes[0].snorm)
++         needs_software_blend = true;
++
+       uint8_t rt_mask = 1 << i;
+       pipeline->blend.enables |= rt_mask;
+ 
+@@ -147,10 +155,8 @@ pack_blend(struct v3dv_pipeline *pipeline,
+       }
+    }
+ 
+-   /* We may want to fallback to software in other cases in the future such
+-    * as for formats not supported by the blend hardware.
+-    */
+-   pipeline->blend.use_software = V3D_DBG(SOFT_BLEND) || needs_dual_src;
++   pipeline->blend.use_software =
++      V3D_DBG(SOFT_BLEND) || needs_dual_src || needs_software_blend;
+    pipeline->blend.color_write_masks = color_write_masks;
+ }
+ 
+-- 
+2.47.3
+
