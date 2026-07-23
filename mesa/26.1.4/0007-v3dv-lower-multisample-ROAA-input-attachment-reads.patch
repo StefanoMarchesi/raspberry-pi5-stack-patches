@@ -1,0 +1,25 @@
+From ef9f03712295e6a35434013d8253c4e75d687586 Mon Sep 17 00:00:00 2001
+From: Stefano Marchesi <marchesi@studioup.it>
+Date: Thu, 16 Jul 2026 09:55:13 +0200
+Subject: [PATCH 7/7] v3dv: lower multisample ROAA input attachment reads
+
+---
+ src/broadcom/vulkan/v3dv_pipeline.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.c b/src/broadcom/vulkan/v3dv_pipeline.c
+index 2edba79..e3cc3ac 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline.c
++++ b/src/broadcom/vulkan/v3dv_pipeline.c
+@@ -1072,7 +1072,7 @@ lower_roaa_input_attachment_cb(nir_builder *b, nir_instr *instr, void *data)
+       return false;
+ 
+    nir_tex_instr *tex = nir_instr_as_tex(instr);
+-   if (tex->op != nir_texop_txf)
++   if (tex->op != nir_texop_txf && tex->op != nir_texop_txf_ms)
+       return false;
+ 
+    /* Input attachment loads keep their subpass sampler dim after
+-- 
+2.47.0
+

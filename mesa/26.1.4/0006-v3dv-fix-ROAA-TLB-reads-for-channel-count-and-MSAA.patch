@@ -1,0 +1,152 @@
+From 108f280e0c481686efe6ad08c279ce6716dc9e63 Mon Sep 17 00:00:00 2001
+From: Stefano Marchesi <marchesi@studioup.it>
+Date: Thu, 16 Jul 2026 09:44:32 +0200
+Subject: [PATCH 6/7] v3dv: fix ROAA TLB reads for channel count and MSAA
+
+---
+ src/broadcom/vulkan/v3dv_pipeline.c | 82 +++++++++++++++++++++++------
+ 1 file changed, 67 insertions(+), 15 deletions(-)
+
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.c b/src/broadcom/vulkan/v3dv_pipeline.c
+index 99d71e9..2edba79 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline.c
++++ b/src/broadcom/vulkan/v3dv_pipeline.c
+@@ -994,14 +994,51 @@ struct roaa_lower_state {
+ };
+ 
+ static nir_def *
+-roaa_load_tlb_color(nir_builder *b, unsigned rt, unsigned sample)
++roaa_load_tlb_color(nir_builder *b, struct v3dv_pipeline *pipeline,
++                    unsigned rt, unsigned sample)
+ {
++   VkFormat format = pipeline->rendering_info.color_attachment_formats[rt];
++   assert(format != VK_FORMAT_UNDEFINED);
++   const struct util_format_description *desc = vk_format_description(format);
++   assert(desc->nr_channels > 0 && desc->nr_channels <= 4);
++
+    nir_def *comps[4];
+-   for (unsigned i = 0; i < 4; i++) {
++   for (unsigned i = 0; i < desc->nr_channels; i++) {
+       comps[i] = nir_load_tlb_color_brcm(b, 1, 32, nir_imm_int(b, rt),
+                                          .base = sample, .component = i);
+    }
+-   return nir_vec(b, comps, 4);
++   return nir_vec(b, comps, desc->nr_channels);
++}
++
++/* Input attachment loads return four components even when the attachment
++ * format has fewer channels.  The TLB must only be asked for channels that
++ * are actually present (the backend cannot manufacture a QPU register for a
++ * missing channel), so append the Vulkan default values after the read.
++ */
++static nir_def *
++roaa_expand_color(nir_builder *b, VkFormat format, nir_def *color,
++                  unsigned num_components)
++{
++   assert(num_components <= 4);
++
++   if (color->num_components == num_components)
++      return color;
++   if (color->num_components > num_components)
++      return nir_trim_vector(b, color, num_components);
++
++   const bool is_integer = vk_format_is_int(format);
++   nir_def *comps[4];
++   for (unsigned i = 0; i < num_components; i++) {
++      if (i < color->num_components) {
++         comps[i] = nir_channel(b, color, i);
++      } else if (i == 3) {
++         comps[i] = is_integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f);
++      } else {
++         comps[i] = nir_imm_int(b, 0);
++      }
++   }
++
++   return nir_vec(b, comps, num_components);
+ }
+ 
+ /* For 16-bit normalized formats the TLB read returns the raw integer values
+@@ -1096,22 +1133,22 @@ lower_roaa_input_attachment_cb(nir_builder *b, nir_instr *instr, void *data)
+     * select chain (the backend reads all the samples from the TLB on the
+     * first read and caches them, so the extra loads are just MOVs).
+     */
+-   nir_def *out = roaa_load_tlb_color(b, rt, 0);
++   nir_def *out = roaa_load_tlb_color(b, pipeline, rt, 0);
+    if (pipeline->msaa) {
+       int ms_idx = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+       if (ms_idx >= 0) {
+          nir_def *sample = tex->src[ms_idx].src.ssa;
+          for (unsigned i = 1; i < V3D_MAX_SAMPLES; i++) {
+             out = nir_bcsel(b, nir_ieq_imm(b, sample, i),
+-                            roaa_load_tlb_color(b, rt, i), out);
++                            roaa_load_tlb_color(b, pipeline, rt, i), out);
+          }
+       }
+    }
+ 
+    out = roaa_convert_norm16(b, pipeline, rt, out);
+-
+-   if (tex->def.num_components < 4)
+-      out = nir_trim_vector(b, out, tex->def.num_components);
++   out = roaa_expand_color(b,
++                          pipeline->rendering_info.color_attachment_formats[rt],
++                          out, tex->def.num_components);
+ 
+    b->shader->info.fs.uses_fbfetch_output = true;
+ 
+@@ -1160,10 +1197,11 @@ roaa_written_rts(nir_shader *nir)
+ }
+ 
+ /* Finds the existing nir_var_shader_out for a given color RT, or creates one
+- * (a plain vec4 FRAG_RESULT_DATA0+rt output) if none exists.
++ * with the render-target format's base type and channel count if none exists.
+  */
+ static nir_variable *
+-roaa_get_or_create_output(nir_shader *nir, unsigned rt)
++roaa_get_or_create_output(nir_shader *nir, struct v3dv_pipeline *pipeline,
++                          unsigned rt)
+ {
+    nir_foreach_shader_out_variable(var, nir) {
+       if (var->data.index == 0 &&
+@@ -1173,8 +1211,15 @@ roaa_get_or_create_output(nir_shader *nir, unsigned rt)
+ 
+    char name[16];
+    snprintf(name, sizeof(name), "roaa_out%u", rt);
++   VkFormat format = pipeline->rendering_info.color_attachment_formats[rt];
++   assert(format != VK_FORMAT_UNDEFINED);
++   const struct util_format_description *desc = vk_format_description(format);
++   enum glsl_base_type base_type =
++      vk_format_is_sint(format) ? GLSL_TYPE_INT :
++      vk_format_is_uint(format) ? GLSL_TYPE_UINT : GLSL_TYPE_FLOAT;
+    nir_variable *var =
+-      nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), name);
++      nir_variable_create(nir, nir_var_shader_out,
++                          glsl_vector_type(base_type, desc->nr_channels), name);
+    var->data.location = FRAG_RESULT_DATA0 + rt;
+    var->data.index = 0;
+    return var;
+@@ -1235,10 +1280,17 @@ lower_roaa_input_attachments(nir_shader *nir, struct v3dv_pipeline *pipeline)
+       nir_builder b = nir_builder_at(nir_after_impl(impl));
+ 
+       u_foreach_bit(rt, pending) {
+-         nir_variable *var = roaa_get_or_create_output(nir, rt);
+-         nir_def *val = roaa_convert_norm16(&b, pipeline, rt,
+-                                            roaa_load_tlb_color(&b, rt, 0));
+-         nir_store_var(&b, var, val, 0xf);
++         nir_variable *var = roaa_get_or_create_output(nir, pipeline, rt);
++         nir_def *val = roaa_load_tlb_color(&b, pipeline, rt, 0);
++         if (pipeline->msaa) {
++            nir_def *sample = nir_load_sample_id(&b);
++            for (unsigned i = 1; i < V3D_MAX_SAMPLES; i++) {
++               val = nir_bcsel(&b, nir_ieq_imm(&b, sample, i),
++                               roaa_load_tlb_color(&b, pipeline, rt, i), val);
++            }
++         }
++         val = roaa_convert_norm16(&b, pipeline, rt, val);
++         nir_store_var(&b, var, val, BITFIELD_MASK(val->num_components));
+       }
+ 
+       nir->info.fs.uses_fbfetch_output = true;
+-- 
+2.47.0
+
